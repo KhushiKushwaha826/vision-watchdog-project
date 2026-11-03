@@ -7,7 +7,7 @@ FRAME_W, FRAME_H = 320, 240
 BASELINE_FRAMES = 60      # shuru ke itne frames se "healthy" values seekhenge
 FROZEN_THRESHOLD = 0.5    # isse kam diff = frame same
 FROZEN_COUNT_LIMIT = 15   # itne frames lagatar same = frozen
-BLUR_RATIO = 0.4          # sharpness baseline ke is fraction se kam ho to alert
+BLUR_RATIO = 0.7          # sharpness baseline ke is fraction se kam ho to alert
 
 # ---------- Webcam kholo ----------
 cap = cv2.VideoCapture(CAMERA_INDEX)
