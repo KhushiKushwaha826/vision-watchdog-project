@@ -24,6 +24,7 @@ YOLO_CONF = 0.4
 MODEL_WINDOW = 10
 MODEL_RATIO = 0.6
 MODEL_PENALTY = 25
+NOISE_RATIO = 2.5
 S = 2
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -105,7 +106,7 @@ while True:
         base = state["base"]
         dark = bright < 0.5 * base["bright"] or bright < DARK_LIMIT
         blurry = sharp < SMOOTH_LIMIT or sharp < BLUR_RATIO * base["sharp"]
-
+        noisy = sharp > NOISE_RATIO * base["sharp"]
         if frozen_counter >= FROZEN_COUNT_LIMIT:
             cam_problems.append("FROZEN FEED")
             score -= 50
@@ -121,7 +122,11 @@ while True:
             cam_problems.append("BLUR / DIRTY LENS")
             score -= 30
 
-        if not dark and not blurry:
+        if noisy:
+            cam_problems.append("NOISE / SENSOR FAULT")
+            score -= 30
+
+        if not dark and not blurry and not noisy:
             bad = []
             ch, cw = gray.shape[0] // GRID, gray.shape[1] // GRID
             for r in range(GRID):
