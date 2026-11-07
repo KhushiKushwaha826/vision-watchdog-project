@@ -3,6 +3,15 @@ import numpy as np
 from checks import prepare, sharpness, brightness, cell_sharpness
 from faults import FAULTS
 
+def cell_brightness(gray, grid=3):
+    h, w = gray.shape
+    ch, cw = h // grid, w // grid
+    out = np.zeros((grid, grid))
+    for r in range(grid):
+        for c in range(grid):
+            out[r, c] = gray[r*ch:(r+1)*ch, c*cw:(c+1)*cw].mean()
+    return out
+
 np.random.seed(0)          # same random grain every run
 
 FAULT_START = 120          # fault begins at this frame
@@ -24,40 +33,45 @@ cap.release()
 print(f"Loaded {len(frames)} frames at {fps:.1f} fps\n")
 
 # ---------- baseline from the first 60 clean frames ----------
-s_list, b_list, c_list = [], [], []
+s_list, b_list, c_list, cb_list = [], [], [], []
 for f in frames[:BASELINE_FRAMES]:
     _, g = prepare(f)
     s_list.append(sharpness(g))
     b_list.append(brightness(g))
     c_list.append(cell_sharpness(g, GRID))
+    cb_list.append(cell_brightness(g, GRID))
 base_s = float(np.mean(s_list))
 base_b = float(np.mean(b_list))
 base_c = np.mean(c_list, axis=0)
+base_cb = np.mean(cb_list, axis=0)
 
 
 def check(frame):
-    """Same rules as watchdog.py. Returns a list of problems (empty = healthy)."""
     _, g = prepare(frame)
-    s, b, c = sharpness(g), brightness(g), cell_sharpness(g, GRID)
+    s, b = sharpness(g), brightness(g)
+    c, cb = cell_sharpness(g, GRID), cell_brightness(g, GRID)
     problems = []
 
     dark = b < 0.5 * base_b or b < 40
+    lowlight = b < 0.75 * base_b
     blurry = s < 15 or s < 0.4 * base_s
     noisy = s > 2.5 * base_s
 
-    if dark:
+    if dark or lowlight:
         problems.append("DARK")
     elif b > 1.5 * base_b and b > 200:
         problems.append("GLARE")
-    if blurry and not dark:
+    if blurry and not (dark or lowlight):
         problems.append("BLUR")
     if noisy:
         problems.append("NOISE")
 
-    if not dark and not blurry and not noisy:
+    if not (dark or lowlight) and not blurry and not noisy:
         for r in range(GRID):
             for col in range(GRID):
-                if base_c[r, col] >= 5.0 and c[r, col] < BLOCK_RATIO * base_c[r, col]:
+                dark_box = base_cb[r, col] > 30 and cb[r, col] < 0.4 * base_cb[r, col]
+                blur_box = base_c[r, col] >= 5.0 and c[r, col] < BLOCK_RATIO * base_c[r, col]
+                if dark_box or blur_box:
                     problems.append("PARTIAL BLOCK")
                     return problems
     return problems
@@ -82,7 +96,12 @@ def first_alert(results, start):
 
 # ---------- 1) false alarms on the clean video ----------
 clean = run()
-false_frames = sum(1 for r in clean[BASELINE_FRAMES:] if r)
+false_frames = 0
+run_len = 0
+for r in clean[BASELINE_FRAMES:]:
+    run_len = run_len + 1 if r else 0
+    if run_len >= NEEDED_IN_A_ROW:
+        false_frames += 1
 print(f"CLEAN VIDEO: {false_frames} false-alarm frames out of {len(clean) - BASELINE_FRAMES}\n")
 
 # ---------- 2) every fault x every severity ----------
