@@ -10,22 +10,37 @@ from checks import (prepare, sharpness, brightness, frame_diff,
 CAMERA_INDEX = 0
 BASELINE_FRAMES = 60
 GRID = 3
-BLUR_RATIO = 0.4
-CELL_RATIO = 0.4
-MIN_BASE = 5.0
-DARK_LIMIT = 40
+BLUR_RATIO = 0.4          # sharpness below 40% of baseline = blur
+NOISE_RATIO = 2.5         # sharpness above 2.5x baseline = noise
+BLOCK_RATIO = 0.25        # box sharpness below 25% of its baseline = blocked
+BOX_DARK_RATIO = 0.4      # box brightness below 40% of its baseline = blocked
+MIN_BASE = 5.0            # ignore plain boxes (almost no edges)
+LOWLIGHT_RATIO = 0.75     # brightness below 75% of baseline = low light
+DARK_LIMIT = 40           # absolute brightness below this = covered
 SMOOTH_LIMIT = 15
 FROZEN_THRESHOLD = 0.5
 FROZEN_COUNT_LIMIT = 15
 SHIFT_LIMIT = 15
 MIN_REF_POINTS = 50
+PERSIST = 5               # camera alert must last 5 frames in a row
 YOLO_EVERY = 3
 YOLO_CONF = 0.4
 MODEL_WINDOW = 10
 MODEL_RATIO = 0.6
 MODEL_PENALTY = 25
-NOISE_RATIO = 2.5
 S = 2
+
+
+def cell_brightness(gray, grid=3):
+    """Average brightness of each grid box."""
+    h, w = gray.shape
+    ch, cw = h // grid, w // grid
+    out = np.zeros((grid, grid))
+    for r in range(grid):
+        for c in range(grid):
+            out[r, c] = gray[r * ch:(r + 1) * ch, c * cw:(c + 1) * cw].mean()
+    return out
+
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
 if not cap.isOpened():
@@ -37,7 +52,7 @@ monitor = ModelMonitor(YOLO("yolov8n.pt"), conf=YOLO_CONF, window=MODEL_WINDOW, 
 
 
 def reset_state():
-    return {"frame_no": 0, "sharp": [], "bright": [], "cells": [],
+    return {"frame_no": 0, "sharp": [], "bright": [], "cells": [], "cbright": [],
             "base": None, "ref_points": 0}
 
 
@@ -45,8 +60,10 @@ state = reset_state()
 prev_gray = None
 frozen_counter = 0
 frame_idx = 0
-print("Pehle 60 frames: khud ko ya known object saaf dikhao, camera stable rakho. 'r' = baseline reset, 'q' = exit.")
 fail_count = 0
+streak = 0
+print("Pehle 60 frames: khud ko saaf dikhao, camera stable rakho. 'r' = baseline reset, 'q' = exit.")
+
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -56,12 +73,13 @@ while True:
             break
         continue
     fail_count = 0
-    frame_idx += 1 
+    frame_idx += 1
 
     small, gray = prepare(frame)
     sharp = sharpness(gray)
     bright = brightness(gray)
     cells = cell_sharpness(gray, GRID)
+    cbright = cell_brightness(gray, GRID)
     diff = frame_diff(prev_gray, gray)
     prev_gray = gray
 
@@ -77,7 +95,8 @@ while True:
     big = cv2.resize(frame, (320 * S, 240 * S))
     cam_problems = []
     model_problems = []
-    score = 100
+    bad_rects = []
+    cam_penalty = 0
     root = ""
 
     if state["base"] is None:
@@ -85,18 +104,22 @@ while True:
         state["sharp"].append(sharp)
         state["bright"].append(bright)
         state["cells"].append(cells)
+        state["cbright"].append(cbright)
         header = f"Learning baseline {state['frame_no']}/{BASELINE_FRAMES}"
         color = (255, 255, 0)
+        score = 100
 
         if state["frame_no"] >= BASELINE_FRAMES:
             state["base"] = {
                 "sharp": float(np.mean(state["sharp"])),
                 "bright": float(np.mean(state["bright"])),
                 "cells": np.mean(state["cells"], axis=0),
+                "cbright": np.mean(state["cbright"], axis=0),
             }
             state["ref_points"] = mover.set_reference(gray)
             monitor.finish_baseline()
             frozen_counter = 0
+            streak = 0
             print(f"Baseline ready: sharp={state['base']['sharp']:.1f}, "
                   f"bright={state['base']['bright']:.1f}, ref points={state['ref_points']}, "
                   f"yolo conf={monitor.base_conf:.2f}, yolo count={monitor.base_count:.2f}")
@@ -105,52 +128,72 @@ while True:
     else:
         base = state["base"]
         dark = bright < 0.5 * base["bright"] or bright < DARK_LIMIT
+        lowlight = bright < LOWLIGHT_RATIO * base["bright"]
         blurry = sharp < SMOOTH_LIMIT or sharp < BLUR_RATIO * base["sharp"]
         noisy = sharp > NOISE_RATIO * base["sharp"]
+
         if frozen_counter >= FROZEN_COUNT_LIMIT:
             cam_problems.append("FROZEN FEED")
-            score -= 50
+            cam_penalty += 50
 
         if dark:
             cam_problems.append("LOW LIGHT / COVERED")
-            score -= 40
+            cam_penalty += 40
+        elif lowlight:
+            cam_problems.append("LOW LIGHT")
+            cam_penalty += 25
         elif bright > 1.5 * base["bright"] and bright > 200:
             cam_problems.append("GLARE")
-            score -= 20
+            cam_penalty += 20
 
-        if blurry and not dark:
+        if blurry and not lowlight:
             cam_problems.append("BLUR / DIRTY LENS")
-            score -= 30
+            cam_penalty += 30
 
         if noisy:
             cam_problems.append("NOISE / SENSOR FAULT")
-            score -= 30
+            cam_penalty += 30
 
-        if not dark and not blurry and not noisy:
-            bad = []
+        if not lowlight and not blurry and not noisy:
             ch, cw = gray.shape[0] // GRID, gray.shape[1] // GRID
+            bad = []
             for r in range(GRID):
                 for c in range(GRID):
-                    if base["cells"][r, c] < MIN_BASE:
-                        continue
-                    if cells[r, c] < CELL_RATIO * base["cells"][r, c]:
+                    dark_box = (base["cbright"][r, c] > 30 and
+                                cbright[r, c] < BOX_DARK_RATIO * base["cbright"][r, c])
+                    blur_box = (base["cells"][r, c] >= MIN_BASE and
+                                cells[r, c] < BLOCK_RATIO * base["cells"][r, c])
+                    if dark_box or blur_box:
                         bad.append(r * GRID + c + 1)
-                        x1, y1 = c * cw * S, r * ch * S
-                        cv2.rectangle(big, (x1, y1), (x1 + cw * S, y1 + ch * S), (0, 0, 255), 2)
+                        bad_rects.append((c * cw * S, r * ch * S, cw * S, ch * S))
             if bad:
-                cam_problems.append("PARTIAL OBSTRUCTION box " + ",".join(map(str, bad)))
-                score -= 20
+                cam_problems.append("PARTIAL BLOCK box " + ",".join(map(str, bad)))
+                cam_penalty += 20
 
             if state["ref_points"] >= MIN_REF_POINTS:
                 shift = mover.shift(gray)
                 if shift is None:
                     cam_problems.append("VIEW CHANGED")
-                    score -= 30
+                    cam_penalty += 30
                 elif shift > SHIFT_LIMIT:
                     cam_problems.append(f"CAMERA MOVED ({shift:.0f}px)")
-                    score -= 30
+                    cam_penalty += 30
+
+        # ---- persistence: alert only if it lasts PERSIST frames in a row ----
+        if cam_problems:
+            streak += 1
+        else:
+            streak = 0
+        if streak < PERSIST:
+            cam_problems = []
+            bad_rects = []
+            cam_penalty = 0
+
+        for (x, y, w, h) in bad_rects:
+            cv2.rectangle(big, (x, y), (x + w, y + h), (0, 0, 255), 2)
 
         model_problems = monitor.degraded()
+        score = 100 - cam_penalty
         if model_problems:
             score -= MODEL_PENALTY
 
@@ -198,6 +241,7 @@ while True:
         state = reset_state()
         monitor.reset()
         frozen_counter = 0
+        streak = 0
         print("Baseline reset. Dobara seekh raha hai...")
 
 cap.release()
